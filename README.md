@@ -82,3 +82,4 @@ each value.
 - Keep `permissions: contents: read`.
 - Workflow **logs are public**. Never `echo` a secret; pass values via `env:`
   rather than inline `${{ }}` interpolation inside a shell command.
+
