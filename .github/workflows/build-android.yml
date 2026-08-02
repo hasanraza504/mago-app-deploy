@@ -1,0 +1,212 @@
+# Android build — free public-repo runners; produces a downloadable AAB or APK.
+#
+# The app source lives in a PRIVATE repo. It is cloned into the runner at build
+# time with a READ-ONLY deploy key, built, and destroyed with the runner.
+# Nothing from it is ever committed here, and only the explicitly named artifact
+# paths are uploaded, so the cloned tree cannot leak that way.
+#
+# Signing is injected as an EAS `credentials.json` written from secrets at run
+# time, so `eas build --local` signs without fetching credentials from EAS and
+# without a keystore living in git. Local builds consume no EAS build credits.
+#
+# WHERE THE BUILD GOES
+# Actions artifacts on a PUBLIC repo are downloadable by anyone who can see the
+# run, and a signed binary embeds the whole JS bundle plus every EXPO_PUBLIC_*
+# value. So nothing is published here: the build is pushed to private OneDrive
+# storage under /onedrive/app-builds/<app>/<platform>/ and needs no passphrase.
+
+name: Build Android
+run-name: "Build Android · ${{ inputs.correlation || 'manual' }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        # Free text, not a choice list: profile names differ per app.
+        description: "EAS build profile (as named in the app's eas.json)"
+        default: production
+      format:
+        description: "Output format"
+        type: choice
+        default: aab
+        options: [aab, apk]
+      ref:
+        description: "Source branch/tag/SHA to build"
+        default: main
+      correlation:
+        # Stamped into run-name so the client that dispatched this build can
+        # find it again. workflow_dispatch returns 204 with no body, so without
+        # this the only way to identify the run is "the newest one", which
+        # races whenever two builds start together.
+        description: "Correlation id (set by tools/buildkit; leave blank when dispatching by hand)"
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  SRC: src
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out the build harness (this repo)
+        uses: actions/checkout@v4
+
+      - name: Check out app source (private, read-only deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          # A deploy key is scoped to exactly one repository and is read-only,
+          # so a leak cannot reach any other repo or write anywhere.
+          ssh-key: ${{ secrets.SOURCE_REPO_SSH_KEY }}
+          path: ${{ env.SRC }}
+          persist-credentials: false
+
+      - name: Set IST release metadata
+        run: |
+          set -euo pipefail
+          stamp="$(TZ=Asia/Kolkata date '+%Y%m%d-%H%M-IST')"
+          source_revision="$(git -C "$SRC" rev-parse --short HEAD)"
+          echo "APP_RELEASE_STAMP=$stamp" >> "$GITHUB_ENV"
+          echo "EXPO_PUBLIC_RELEASE_STAMP=$stamp" >> "$GITHUB_ENV"
+          echo "APP_RELEASE_SOURCE_REVISION=$source_revision" >> "$GITHUB_ENV"
+          echo "EAS_BUILD_MESSAGE=release $stamp ($source_revision)" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: ${{ env.SRC }}/package-lock.json
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install dependencies
+        working-directory: ${{ env.SRC }}
+        run: npm ci --no-audit --no-fund
+
+      - name: Write signing credentials from secrets
+        working-directory: ${{ env.SRC }}
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          : "${KEYSTORE_B64:?ANDROID_KEYSTORE_BASE64 is required}"
+          : "${KEYSTORE_PASSWORD:?ANDROID_KEYSTORE_PASSWORD is required}"
+          : "${KEY_ALIAS:?ANDROID_KEY_ALIAS is required}"
+          : "${KEY_PASSWORD:?ANDROID_KEY_PASSWORD is required}"
+          echo "$KEYSTORE_B64" | base64 -d > release.keystore
+          # jq builds the JSON so a password containing a quote or backslash
+          # cannot corrupt the file — and never reaches the log.
+          jq -n \
+            --arg pw "$KEYSTORE_PASSWORD" \
+            --arg alias "$KEY_ALIAS" \
+            --arg keypw "$KEY_PASSWORD" \
+            '{android:{keystore:{keystorePath:"release.keystore",keystorePassword:$pw,keyAlias:$alias,keyPassword:$keypw}}}' \
+            > credentials.json
+          echo "credentials.json $(stat -c%s credentials.json) bytes; keystore $(stat -c%s release.keystore) bytes"
+
+      - name: Point the profile at local credentials and the requested format
+        working-directory: ${{ env.SRC }}
+        env:
+          PROFILE: ${{ inputs.profile }}
+          FORMAT: ${{ inputs.format }}
+        run: |
+          set -euo pipefail
+          # credentialsSource=local keeps signing entirely offline.
+          # buildType must match the requested artifact or --output is ignored.
+          jq --arg p "$PROFILE" --arg f "$FORMAT" '
+            .build[$p].credentialsSource = "local"
+            | .build[$p].android = ((.build[$p].android // {}) + {buildType: (if $f == "apk" then "apk" else "app-bundle" end)})
+          ' eas.json > eas.json.tmp && mv eas.json.tmp eas.json
+          jq ".build[\"$PROFILE\"]" eas.json
+
+      - name: Build with EAS (local — consumes no EAS build credits)
+        working-directory: ${{ env.SRC }}
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          # The source is a detached checkout; stop EAS resolving a VCS root.
+          EAS_NO_VCS: "1"
+          PROFILE: ${{ inputs.profile }}
+          FORMAT: ${{ inputs.format }}
+          APP_RELEASE_STAMP: ${{ env.APP_RELEASE_STAMP }}
+          EXPO_PUBLIC_RELEASE_STAMP: ${{ env.EXPO_PUBLIC_RELEASE_STAMP }}
+          APP_RELEASE_SOURCE_REVISION: ${{ env.APP_RELEASE_SOURCE_REVISION }}
+          EAS_BUILD_MESSAGE: ${{ env.EAS_BUILD_MESSAGE }}
+        run: |
+          set -euo pipefail
+          npx eas-cli@latest build \
+            --local \
+            --non-interactive \
+            --platform android \
+            --profile "$PROFILE" \
+            --message "$EAS_BUILD_MESSAGE" \
+            --output "$RUNNER_TEMP/app.$FORMAT"
+          ls -lh "$RUNNER_TEMP/app.$FORMAT"
+
+      - name: Upload to OneDrive
+        # The artifact goes to private cloud storage instead of GitHub Actions
+        # artifacts, which on a PUBLIC repo are downloadable by anyone. Nothing
+        # is published from this repo, so the binary needs no passphrase.
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONFIG_ONEDRIVE }}
+          EXT: ${{ inputs.format }}
+          SRC_SHA: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RCLONE_CONF:-}" ]; then
+            echo "::error::RCLONE_CONFIG_ONEDRIVE is unset — refusing to finish with nowhere to put the build."
+            exit 1
+          fi
+          curl -fsSL https://rclone.org/install.sh | sudo bash >/dev/null 2>&1 || {
+            echo "::error::rclone install failed"; exit 1; }
+
+          # sha256 used to be produced by the (now removed) encrypt step.
+          ( cd "$RUNNER_TEMP" && sha256sum "app.${EXT}" > sha256.txt && cat sha256.txt )
+
+          conf="$RUNNER_TEMP/rclone.conf"
+          printf '%s' "$RCLONE_CONF" > "$conf"
+          chmod 600 "$conf"
+
+          # Repo is <app>-deploy; the OneDrive folder is <app>.
+          app="${GITHUB_REPOSITORY##*/}"; app="${app%-deploy}"
+          # Stamp the file so builds are self-describing in the folder listing.
+          stamp="$APP_RELEASE_STAMP"
+          name="${app}-android-${stamp}-run${GITHUB_RUN_NUMBER}.${EXT}"
+
+          rclone --config "$conf" copyto "$RUNNER_TEMP/app.${EXT}" \
+            "builds:${app}/android/${name}" --no-traverse
+          rclone --config "$conf" copyto "$RUNNER_TEMP/sha256.txt" \
+            "builds:${app}/android/${name}.sha256" --no-traverse
+          rm -f "$conf"
+
+          {
+            echo "### Build uploaded"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| file | \`${name}\` |"
+            echo "| OneDrive | \`/onedrive/app-builds/${app}/android/\` |"
+            echo "| source ref | \`${SRC_SHA}\` |"
+            echo "| sha256 | \`$(cut -d" " -f1 "$RUNNER_TEMP/sha256.txt")\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "uploaded ${name}"
+
+      - name: Scrub credentials from the runner
+        if: always()
+        run: rm -f "$SRC/credentials.json" "$SRC/release.keystore" || true
