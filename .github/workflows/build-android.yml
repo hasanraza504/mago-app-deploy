@@ -91,7 +91,14 @@ jobs:
           distribution: temurin
           java-version: 17
 
+      # packages: '' skips the action's default `tools platform-tools` install.
+      # The runner image's cmdline-tools 16.0 no longer publishes the legacy
+      # `tools` package, so the default made sdkmanager exit 1 and failed every
+      # Android build. The image already ships a usable SDK and Gradle fetches
+      # what the build needs, so installing nothing here is correct.
       - uses: android-actions/setup-android@v3
+        with:
+          packages: ''
 
       - name: Install dependencies
         working-directory: ${{ env.SRC }}
