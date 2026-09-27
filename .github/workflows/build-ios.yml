@@ -33,6 +33,11 @@ on:
       ref:
         description: "Source branch/tag/SHA to build"
         default: main
+      storage:
+        description: "Artifact storage"
+        type: choice
+        default: onedrive
+        options: [onedrive, ssh]
       correlation:
         # Stamped into run-name so the client that dispatched this build can
         # find it again. workflow_dispatch returns 204 with no body, so without
@@ -222,6 +227,7 @@ jobs:
           echo "signing identity matches the certificate and profile Apple knows"
 
       - name: Upload to OneDrive
+        if: inputs.storage != 'ssh'
         # The artifact goes to private cloud storage instead of GitHub Actions
         # artifacts, which on a PUBLIC repo are downloadable by anyone. Nothing
         # is published from this repo, so the binary needs no passphrase.
@@ -268,6 +274,31 @@ jobs:
             echo "| sha256 | \`$(cut -d" " -f1 "$RUNNER_TEMP/sha256.txt")\` |"
           } >> "$GITHUB_STEP_SUMMARY"
           echo "uploaded ${name}"
+
+      - name: Upload signed artifact to app-storage over SSH
+        if: inputs.storage == 'ssh'
+        env:
+          APP_STORAGE_SSH_KEY: ${{ secrets.APP_STORAGE_SSH_KEY }}
+          APP_STORAGE_KNOWN_HOSTS: ${{ secrets.APP_STORAGE_KNOWN_HOSTS }}
+          EXT: ipa
+        run: |
+          set -euo pipefail
+          key="$RUNNER_TEMP/app-storage.key"
+          known="$RUNNER_TEMP/app-storage.known_hosts"
+          trap 'rm -f "$key" "$known"' EXIT
+          printf '%s\n' "$APP_STORAGE_SSH_KEY" > "$key"
+          printf '%s\n' "$APP_STORAGE_KNOWN_HOSTS" > "$known"
+          chmod 600 "$key" "$known"
+          stamp="${APP_RELEASE_STAMP%-IST}"
+          version="${stamp/-/.}"
+          name="mago-app_${version}-run${GITHUB_RUN_NUMBER}.${EXT}"
+          sha="$(shasum -a 256 "$RUNNER_TEMP/app.${EXT}" | cut -d ' ' -f1)"
+          revision="$(git -C "$SRC" rev-parse HEAD)"
+          ssh -i "$key" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known" \
+            ubuntu@140.245.239.151 "ios $name $sha $revision" < "$RUNNER_TEMP/app.${EXT}"
+          echo "### Uploaded signed ios build" >> "$GITHUB_STEP_SUMMARY"
+          echo "https://dl.kohaconsultants.co.in/$name" >> "$GITHUB_STEP_SUMMARY"
+          echo "Source: $revision; SHA256: $sha" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Scrub credentials from the runner
         if: always()
